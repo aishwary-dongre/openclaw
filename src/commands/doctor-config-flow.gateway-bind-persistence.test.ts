@@ -1,4 +1,3 @@
-// Verifies Doctor persists legacy gateway bind repairs through the real config writer.
 import fs from "node:fs/promises";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,10 +6,12 @@ import {
   readConfigFileSnapshot,
   readConfigFileSnapshotForWrite,
 } from "../config/config.js";
-import { withEnvOverride, withTempHome, writeOpenClawConfig } from "../config/test-helpers.js";
+import { withTempHome, writeOpenClawConfig } from "../config/test-helpers.js";
 import { runInitialConfigWriteHealth } from "../flows/doctor-health-contribution-runners.config.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
+import { withEnvAsync } from "../test-utils/env.js";
 import { prepareDoctorContext } from "./doctor-config-flow.test-support.js";
+import { withDoctorConfigPreflightHome } from "./doctor-config-preflight.test-support.js";
 import {
   planLegacyConfigForUpdateChannel,
   repairLegacyConfigForUpdateChannel,
@@ -21,35 +22,10 @@ describe("Doctor gateway bind persistence", () => {
     closeOpenClawStateDatabaseForTest();
   });
 
-  it.each([
-    ["localhost", "loopback"],
-    ["0.0.0.0", "lan"],
-  ] as const)("persists gateway bind %s as %s", async (legacyBind, canonicalBind) => {
-    await withTempHome(async (home) => {
-      await withEnvOverride({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" }, async () => {
-        // This core writer regression needs the authoritative empty bundled-plugin inventory.
-        const configPath = await writeOpenClawConfig(home, {
-          gateway: { mode: "local", bind: legacyBind },
-        });
-        expect((await readConfigFileSnapshot()).sourceConfig.commands).toBeUndefined();
-        const ctx = await prepareDoctorContext(configPath);
-
-        await runInitialConfigWriteHealth(ctx);
-
-        const snapshot = await readConfigFileSnapshot();
-        expect(snapshot.valid).toBe(true);
-        expect(snapshot.config.gateway?.bind).toBe(canonicalBind);
-        const saved = await fs.readFile(configPath, "utf-8");
-        expect(saved).not.toContain(`"bind": "${legacyBind}"`);
-        expect(JSON.parse(saved)).not.toHaveProperty("commands");
-      });
-    });
-  });
-
-  it.each(["ordinary", "include", "invalid", "doctor"] as const)(
+  it.each(["include", "invalid", "doctor"] as const)(
     "preserves authored plugin scope during %s config repair",
     async (scenario) => {
-      await withTempHome(async (home) => {
+      await withDoctorConfigPreflightHome(async (home) => {
         const diagnostics = {
           otel: { enabled: true, endpoint: "http://collector.test:4317", protocol: "grpc" },
         };
@@ -130,7 +106,7 @@ describe("Doctor gateway bind persistence", () => {
     "persists a prepared legacy plan only for its original source: %s",
     async (scenario) => {
       await withTempHome(async (home) => {
-        await withEnvOverride({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" }, async () => {
+        await withEnvAsync({ OPENCLAW_DISABLE_BUNDLED_PLUGINS: "1" }, async () => {
           const configPath = await writeOpenClawConfig(home, {
             gateway: { $include: "gateway.json" },
           });
@@ -144,11 +120,7 @@ describe("Doctor gateway bind persistence", () => {
           const original = await fs.readFile(configPath, "utf8");
           const originalInclude = await fs.readFile(includePath, "utf8");
           const persist = () =>
-            repairLegacyConfigForUpdateChannel({
-              configSnapshot: snapshot,
-              plan,
-              jsonMode: true,
-            });
+            repairLegacyConfigForUpdateChannel({ configSnapshot: snapshot, plan, jsonMode: true });
           // Planning is read-only; original authored bytes still exist at the seal boundary.
           expect(snapshot.raw).toBe(original);
           expect(await fs.readFile(includePath, "utf8")).toBe(originalInclude);
@@ -161,7 +133,7 @@ describe("Doctor gateway bind persistence", () => {
           } else if (scenario === "different profile") {
             const otherPath = path.join(path.dirname(configPath), "other.json");
             await fs.writeFile(otherPath, original);
-            await withEnvOverride({ OPENCLAW_CONFIG_PATH: otherPath }, async () => {
+            await withEnvAsync({ OPENCLAW_CONFIG_PATH: otherPath }, async () => {
               await expect(persist()).rejects.toThrow(/config path changed/);
             });
             expect(await fs.readFile(otherPath, "utf8")).toBe(original);

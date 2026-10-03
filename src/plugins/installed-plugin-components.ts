@@ -1,7 +1,11 @@
+import path from "node:path";
+import { sortUniqueStrings } from "@openclaw/normalization-core/string-normalization";
 import type {
   PluginDeclaredSurface,
   PluginInstalledComponents,
 } from "../../packages/gateway-protocol/src/schema/plugins.js";
+import { loadHookEntriesFromDir } from "../hooks/discovery.js";
+import { resolvePluginSkillDetails } from "../skills/loading/plugin-skills.js";
 import { inspectBundleLspRuntimeSupport } from "./bundle-lsp.js";
 import {
   inspectBundleMcpRuntimeSupport,
@@ -9,10 +13,6 @@ import {
 } from "./bundle-mcp.js";
 import { inspectBundlePluginArtifact } from "./install-artifact-inspection.js";
 import type { PluginManifestRecord } from "./manifest-registry.js";
-
-function sorted(values: Iterable<string>): string[] {
-  return [...new Set(values)].toSorted();
-}
 
 export function emptyInstalledPluginComponents(): PluginInstalledComponents {
   return {
@@ -32,6 +32,8 @@ export function projectInstalledPluginComponents(params: {
   declared: PluginDeclaredSurface;
 }): PluginInstalledComponents {
   const { manifest, declared } = params;
+  const skillDetails = manifest?.rootDir ? resolvePluginSkillDetails(manifest) : undefined;
+  const skillNames = skillDetails?.map((skill) => skill.name) ?? sortUniqueStrings(declared.skills);
   if (manifest?.format !== "bundle" || !manifest.bundleFormat) {
     const mcp = manifest?.rootDir
       ? inspectNativePluginMcpRuntimeSupport({
@@ -39,10 +41,10 @@ export function projectInstalledPluginComponents(params: {
           mcpServers: manifest.mcpServers ?? {},
         })
       : undefined;
-    const skills = sorted(declared.skills);
-    const mcpServers = sorted(mcp?.supportedServerNames ?? declared.mcpServers);
-    const commands = sorted(declared.cliCommands);
-    const hooks = sorted(declared.hooks);
+    const skills = skillNames;
+    const mcpServers = sortUniqueStrings(mcp?.supportedServerNames ?? declared.mcpServers);
+    const commands = sortUniqueStrings(declared.cliCommands);
+    const hooks = sortUniqueStrings(declared.hooks);
     return {
       mapped: [
         ...(skills.length > 0 ? ["skills"] : []),
@@ -51,13 +53,14 @@ export function projectInstalledPluginComponents(params: {
         ...(hooks.length > 0 ? ["hooks"] : []),
       ],
       skills,
+      ...(skillDetails ? { skillDetails } : {}),
       mcpServers,
       commands,
       hooks,
       lspServers: [],
       unavailable: {
         capabilities: [],
-        mcpServers: sorted(mcp?.unsupportedServerNames ?? []),
+        mcpServers: sortUniqueStrings(mcp?.unsupportedServerNames ?? []),
         lspServers: [],
       },
     };
@@ -68,6 +71,23 @@ export function projectInstalledPluginComponents(params: {
     capabilities: manifest.bundleCapabilities ?? [],
   });
   const mapped = new Set(support.mapped);
+  const hooks =
+    mapped.has("hooks") && manifest.rootDir
+      ? sortUniqueStrings(
+          (manifest.hooks ?? []).filter((dir) =>
+            loadHookEntriesFromDir({
+              dir: path.resolve(manifest.rootDir, dir),
+              rootDir: manifest.rootDir,
+              pluginId: manifest.id,
+              source: "openclaw-plugin",
+            }).some(({ hook }) => Boolean(hook.handlerPath)),
+          ),
+        )
+      : [];
+  if (mapped.has("hooks") && hooks.length === 0) {
+    mapped.delete("hooks");
+    support.unavailable.push("hooks");
+  }
   const mcp = manifest.rootDir
     ? inspectBundleMcpRuntimeSupport({
         pluginId: manifest.id,
@@ -83,16 +103,17 @@ export function projectInstalledPluginComponents(params: {
       })
     : undefined;
   return {
-    mapped: sorted(mapped),
-    skills: mapped.has("skills") ? sorted(declared.skills) : [],
-    mcpServers: mapped.has("mcpServers") ? sorted(mcp?.supportedServerNames ?? []) : [],
+    mapped: sortUniqueStrings(mapped),
+    skills: mapped.has("skills") ? skillNames : [],
+    ...(mapped.has("skills") && skillDetails ? { skillDetails } : {}),
+    mcpServers: mapped.has("mcpServers") ? sortUniqueStrings(mcp?.supportedServerNames ?? []) : [],
     commands: [],
-    hooks: mapped.has("hooks") ? sorted(declared.hooks) : [],
-    lspServers: mapped.has("lspServers") ? sorted(lsp?.supportedServerNames ?? []) : [],
+    hooks,
+    lspServers: mapped.has("lspServers") ? sortUniqueStrings(lsp?.supportedServerNames ?? []) : [],
     unavailable: {
-      capabilities: sorted(support.unavailable),
-      mcpServers: sorted(mcp?.unsupportedServerNames ?? []),
-      lspServers: sorted(lsp?.unsupportedServerNames ?? []),
+      capabilities: sortUniqueStrings(support.unavailable),
+      mcpServers: sortUniqueStrings(mcp?.unsupportedServerNames ?? []),
+      lspServers: sortUniqueStrings(lsp?.unsupportedServerNames ?? []),
     },
   };
 }

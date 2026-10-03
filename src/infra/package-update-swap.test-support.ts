@@ -1,8 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { PackageRecoveryHooks } from "./package-update-recovery.js";
 import { createNpmTarget, writePackageRoot } from "./package-update-steps.test-support.js";
-import { swapStagedPackageInstall, type PackageUpdateTransaction } from "./package-update-swap.js";
+import type { PackageUpdateTransaction } from "./package-update-swap-contract.js";
+import { swapStagedPackageInstall } from "./package-update-swap.js";
 
 export async function createPackageSwapFixture(base: string) {
   const prefix = path.join(base, "live");
@@ -37,12 +37,15 @@ export async function createPackageSwapFixture(base: string) {
   return { params, packageRoot, globalRoot, launcher };
 }
 
-export async function createRetainedPackageSwap(base: string, recovery?: PackageRecoveryHooks) {
+export async function createRetainedPackageSwap(
+  base: string,
+  prepare?: (fixture: Awaited<ReturnType<typeof createPackageSwapFixture>>) => Promise<void>,
+) {
   const fixture = await createPackageSwapFixture(base);
+  await prepare?.(fixture);
   let transaction: PackageUpdateTransaction | undefined;
   const result = await swapStagedPackageInstall({
     ...fixture.params,
-    recovery,
     onTransaction: (retained) => {
       transaction = retained;
     },

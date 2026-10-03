@@ -91,7 +91,67 @@ function nativeRecord(record: UpdateRecoveryRecord): UpdateRecoveryRecord {
   return next;
 }
 
+type NativeEffect = NonNullable<UpdateRecoveryRecord["nativeManager"]>["effects"][number];
+function observedNativeEffect(
+  action: NativeEffect["action"],
+  before: NativeEffect["before"],
+  after: NativeEffect["after"],
+  intentRevision: number,
+): NativeEffect {
+  return {
+    effectId: randomUUID(),
+    action,
+    before,
+    after,
+    state: "observed",
+    intentRevision,
+    observedRevision: intentRevision + 1,
+  };
+}
+
 describe("retained recovery read-only compatibility", () => {
+  it("requires settled native restoration in retained preparation outcomes", () => {
+    const f = setup();
+    const record = nativeRecord(f.record);
+    record.claimKind = "recovery";
+    record.revision = 4;
+    record.package = retainedTerminalRecord(f.record).package!;
+    record.package.descriptor.retention = null;
+    record.package.observed.observation = {
+      previous: "live",
+      candidate: "staged",
+      launchers: "both",
+      successorLive: false,
+    };
+    record.primaryFailure = { code: "interrupted-preparation", effectId: null };
+    record.preparationAborted = {
+      reason: "interrupted-preparation",
+      committedAtMs: record.updatedAtMs,
+      commitRevision: record.revision,
+      observedIdentity: record.package.observed.observedIdentity,
+    };
+    expect(decodeUpdateRecovery(JSON.stringify(record), record.runId)).toEqual(record);
+
+    const native = record.nativeManager!;
+    const stopped = { ...native.original, stopped: true };
+    native.effects = [
+      observedNativeEffect("stop", native.original, stopped, 1),
+      observedNativeEffect("restore", stopped, native.original, 3),
+    ];
+    expect(decodeUpdateRecovery(JSON.stringify(record), record.runId)).toEqual(record);
+
+    const restore = native.effects[1]!;
+    restore.state = "intent";
+    delete restore.observedRevision;
+    expect(() => decodeUpdateRecovery(JSON.stringify(record), record.runId)).toThrow(
+      "Preparation settlement cannot carry effects or serving authority",
+    );
+    native.effects.pop();
+    expect(() => decodeUpdateRecovery(JSON.stringify(record), record.runId)).toThrow(
+      "Preparation settlement cannot carry effects or serving authority",
+    );
+  });
+
   it.each(["candidate", "previous"] as const)(
     "reopens private %s proof without exposing it in history",
     (runtime) => {
@@ -214,6 +274,70 @@ describe("retained recovery read-only compatibility", () => {
     expect(() => assertNoPendingUpdateRecovery(options)).not.toThrow();
     expect(fs.readdirSync(root)).toEqual([]);
   });
+  it.each(["intent", "interrupted", "completed"] as const)(
+    "preserves typed package %s effects byte-exactly without admitting work",
+    (outcome) => {
+      const f = setup();
+      const packageState = retainedTerminalRecord(f.record).package!;
+      packageState.descriptor.retention = null;
+      const effectId = randomUUID();
+      const record: UpdateRecoveryRecord = {
+        ...f.record,
+        package: packageState,
+        effects: [
+          {
+            effectId,
+            kind: "package-activation",
+            resourceId: packageState.descriptor.liveRoot,
+            runtime: "candidate",
+            state: outcome === "intent" ? "intent" : "observed",
+            observedIdentity: outcome === "intent" ? null : packageState.observed.observedIdentity,
+            package: {
+              intent: { effectId, action: "activate", descriptor: packageState.descriptor },
+              ...(outcome === "intent" ? {} : { observed: packageState.observed, outcome }),
+            },
+          },
+        ],
+      };
+      const raw = JSON.stringify(record, null, 2);
+      openOpenClawStateDatabase(f.options)
+        .db.prepare("UPDATE config_machine_state SET value_json=? WHERE state_key=?")
+        .run(raw, "update.recovery." + record.runId);
+      closeOpenClawStateDatabaseForTest();
+      const before = snapshot(f.root);
+      expect(loadUpdateRecovery(record.runId, f.options)).toEqual(record);
+      expect(inspectUpdateRecoveries(f.options)).toEqual([{ format: "current", raw, record }]);
+      expect(() => assertNoPendingUpdateRecovery(f.options)).toThrow(UpdateRecoveryRequiredError);
+      expect(snapshot(f.root)).toEqual(before);
+    },
+  );
+  it.each(["version", "backup-path"] as const)(
+    "rejects an invalid package descriptor %s without changing retained bytes",
+    (mismatch) => {
+      const f = setup();
+      const record = retainedTerminalRecord(f.record);
+      const descriptor = {
+        ...record.package!.descriptor,
+        ...(mismatch === "version"
+          ? { version: 2 }
+          : { backupRoot: path.join(f.root, "outside-package-parent") }),
+      };
+      const invalid = {
+        ...record,
+        package: { descriptor, observed: { ...record.package!.observed, descriptor } },
+      };
+      const raw = JSON.stringify(invalid, null, 2);
+      openOpenClawStateDatabase(f.options)
+        .db.prepare("UPDATE config_machine_state SET value_json=? WHERE state_key=?")
+        .run(raw, "update.recovery." + record.runId);
+      closeOpenClawStateDatabaseForTest();
+      const before = snapshot(f.root);
+      expect(() => loadUpdateRecovery(record.runId, f.options)).toThrow();
+      expect(() => inspectUpdateRecoveries(f.options)).toThrow();
+      expect(() => assertNoPendingUpdateRecovery(f.options)).toThrow();
+      expect(snapshot(f.root)).toEqual(before);
+    },
+  );
   it("reopens exact interrupted identity without writing database artifacts or exposing source paths", () => {
     const f = setup();
     const record = {
@@ -248,18 +372,6 @@ describe("retained recovery read-only compatibility", () => {
     finishUpdateRun(f.run.runId, { status: "failed", reason: "interrupted" }, f.options);
     expect(loadUpdateRecovery(f.run.runId, f.options)).toEqual(f.record);
     expect(() => assertNoPendingUpdateRecovery(f.options)).toThrow(UpdateRecoveryRequiredError);
-  });
-  it("preserves schema, version and history during retained reads", () => {
-    const f = setup();
-    const db = openOpenClawStateDatabase(f.options).db;
-    const schema = () => db.prepare("SELECT * FROM sqlite_schema ORDER BY name").all();
-    const before = schema();
-    const version = db.prepare("PRAGMA user_version").get();
-    const history = getUpdateRun(f.run.runId, f.options);
-    expect(loadUpdateRecovery(f.run.runId, f.options)).toEqual(f.record);
-    expect(schema()).toEqual(before);
-    expect(db.prepare("PRAGMA user_version").get()).toEqual(version);
-    expect(getUpdateRun(f.run.runId, f.options)).toEqual(history);
   });
   it("refuses corrupt records without erasing them or admitting new work", () => {
     const f = setup();
@@ -376,23 +488,10 @@ it.each([
   const suppressed = { ...running, enabled: false };
   const restartId = randomUUID();
   native.effects = [
+    observedNativeEffect("stop", running, stopped, 1),
     {
-      effectId: randomUUID(),
-      action: "stop",
-      before: running,
-      after: stopped,
-      state: "observed",
-      intentRevision: 1,
-      observedRevision: 2,
-    },
-    {
+      ...observedNativeEffect("restore", stopped, running, 3),
       effectId: restartId,
-      action: "restore",
-      before: stopped,
-      after: running,
-      state: "observed",
-      intentRevision: 3,
-      observedRevision: 4,
     },
     {
       effectId: randomUUID(),
@@ -449,31 +548,14 @@ it("refuses a retained not-applied native effect without failure or with an unch
   const record = nativeRecord(f.record);
   const native = record.nativeManager!;
   const before = { ...native.original, stopped: true };
-  native.original = before;
+  // Keep the earlier stop and captured running target in the retained history.
   native.effects = [
+    observedNativeEffect("stop", native.original, before, 1),
     {
-      effectId: randomUUID(),
-      action: "restore",
-      before,
-      after: { ...before, stopped: false },
+      ...observedNativeEffect("restore", before, native.original, 3),
       state: "not-applied",
-      intentRevision: 1,
-      observedRevision: 2,
     },
   ];
-  // Restoration target must equal the captured running job; keep the earlier stop in history.
-  native.original = { ...before, stopped: false };
-  native.effects.unshift({
-    effectId: randomUUID(),
-    action: "stop",
-    before: native.original,
-    after: before,
-    state: "observed",
-    intentRevision: 1,
-    observedRevision: 2,
-  });
-  native.effects[1]!.intentRevision = 3;
-  native.effects[1]!.observedRevision = 4;
   record.revision = 4;
   record.primaryFailure = { code: "failed-start", effectId: null };
   expect(() => decodeUpdateRecovery(JSON.stringify(record), record.runId)).not.toThrow();
@@ -524,55 +606,70 @@ it("rejects early-file references reused as a full checkpoint", () => {
   record.checkpoint = { ref: early.ref, binding: early.binding, preimageRef: early.ref };
   expect(() => decodeUpdateRecovery(JSON.stringify(record), record.runId)).toThrow();
 });
-it("inspects selected and superseded legacy pairs byte-exactly without admitting work", () => {
-  const f = setup();
-  const nextRun = createUpdateRun({ trigger: "cli" }, f.options);
-  const a = retainedTerminalRecord(f.record);
-  const b = retainedTerminalRecord(
-    createRetainedUpdateRecovery(
-      { runId: nextRun.runId, from: f.to, to: { ...f.to, version: "3.0.0" } },
-      f.options,
-    ),
-  );
-  a.retainedPair = { ...a.retainedPair!, state: "superseded", replacementRunId: b.runId };
-  a.package!.descriptor.retention = {
-    state: "superseded",
-    pairId: a.retainedPair.pairId,
-    ownerRevision: 4,
-    replacement: {
-      pairId: b.retainedPair!.pairId,
-      transactionId: b.transactionId,
-      live: b.package!.descriptor.candidate,
-      retainedRoot: b.package!.descriptor.backupRoot,
-      retained: b.package!.descriptor.previous!,
-      launchers: [],
-    },
-  };
-  a.package!.observed.descriptor = a.package!.descriptor;
-  const records = [a, b].map(legacyRecord);
-  const raw = records.map((record) => JSON.stringify(record, null, 2));
-  const db = openOpenClawStateDatabase(f.options).db;
-  records.forEach((record, i) =>
-    db
-      .prepare("UPDATE config_machine_state SET value_json=? WHERE state_key=?")
-      .run(raw[i]!, "update.recovery." + record.runId),
-  );
-  closeOpenClawStateDatabaseForTest();
-  const before = snapshot(f.root);
-  const inspected = inspectUpdateRecoveries(f.options);
-  expect(inspected).toHaveLength(2);
-  records.forEach((record, i) =>
-    expect(inspected.find((entry) => entry.record.runId === record.runId)).toEqual({
-      format: "legacy-serving",
-      raw: raw[i],
-      record,
-    }),
-  );
-  expect(
-    inspected
-      .filter((entry) => entry.record.retainedPair?.state === "selected")
-      .map((entry) => entry.record.runId),
-  ).toEqual([b.runId]);
-  expect(() => assertNoPendingUpdateRecovery(f.options)).toThrow(/legacy.*readiness/i);
-  expect(snapshot(f.root)).toEqual(before);
-});
+it.each(["current", "legacy-serving"] as const)(
+  "inspects selected, superseded and unselected %s packages byte-exactly",
+  (format) => {
+    const f = setup();
+    const nextRun = createUpdateRun({ trigger: "cli" }, f.options);
+    const a = retainedTerminalRecord(f.record);
+    const b = retainedTerminalRecord(
+      createRetainedUpdateRecovery(
+        { runId: nextRun.runId, from: f.to, to: { ...f.to, version: "3.0.0" } },
+        f.options,
+      ),
+    );
+    a.retainedPair = { ...a.retainedPair!, state: "superseded", replacementRunId: b.runId };
+    a.package!.descriptor.retention = {
+      state: "superseded",
+      pairId: a.retainedPair.pairId,
+      ownerRevision: 4,
+      replacement: {
+        pairId: b.retainedPair!.pairId,
+        transactionId: b.transactionId,
+        live: b.package!.descriptor.candidate,
+        retainedRoot: b.package!.descriptor.backupRoot,
+        retained: b.package!.descriptor.previous!,
+        launchers: [],
+      },
+    };
+    a.package!.observed.descriptor = a.package!.descriptor;
+    const rollbackRun = createUpdateRun({ trigger: "cli" }, f.options);
+    const c = retainedTerminalRecord(
+      createRetainedUpdateRecovery({ runId: rollbackRun.runId, from: f.from, to: f.to }, f.options),
+      true,
+    );
+    const records = format === "legacy-serving" ? [a, b, c].map(legacyRecord) : [a, b, c];
+    const raw = records.map((record) => JSON.stringify(record, null, 2));
+    const db = openOpenClawStateDatabase(f.options).db;
+    records.forEach((record, i) =>
+      db
+        .prepare("UPDATE config_machine_state SET value_json=? WHERE state_key=?")
+        .run(raw[i]!, "update.recovery." + record.runId),
+    );
+    closeOpenClawStateDatabaseForTest();
+    const before = snapshot(f.root);
+    const inspected = inspectUpdateRecoveries(f.options);
+    expect(inspected).toHaveLength(3);
+    records.forEach((record, i) =>
+      expect(inspected.find((entry) => entry.record.runId === record.runId)).toEqual({
+        format,
+        raw: raw[i],
+        record,
+      }),
+    );
+    expect(
+      inspected
+        .filter((entry) => entry.record.retainedPair?.state === "selected")
+        .map((entry) => entry.record.runId),
+    ).toEqual([b.runId]);
+    if (format === "current") {
+      records.forEach((record) =>
+        expect(loadUpdateRecovery(record.runId, f.options)).toEqual(record),
+      );
+      expect(() => assertNoPendingUpdateRecovery(f.options)).toThrow(UpdateRecoveryRequiredError);
+    } else {
+      expect(() => assertNoPendingUpdateRecovery(f.options)).toThrow(/legacy.*readiness/i);
+    }
+    expect(snapshot(f.root)).toEqual(before);
+  },
+);

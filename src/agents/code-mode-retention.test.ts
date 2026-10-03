@@ -1,7 +1,7 @@
 import { fileURLToPath } from "node:url";
 import { expect, it } from "vitest";
 import { runNodeScript } from "../../test/helpers/run-node-script.js";
-import { resolveRuntimeWorkerArgv, resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
+import { resolveRuntimeWorkerUrl } from "../infra/runtime-worker-url.js";
 import {
   codeModeDescriptionRetentionEntrypoint,
   codeModeRetentionEntrypoint,
@@ -20,7 +20,7 @@ it.for([
   },
 ])("$name", { timeout: 30_000 }, async ({ entrypoint, expected }, { signal }) => {
   const result = await runNodeScript(
-    ["--expose-gc", ...resolveRuntimeWorkerArgv(resolveRuntimeWorkerUrl(entrypoint))],
+    (workerArgv) => ["--expose-gc", ...workerArgv(resolveRuntimeWorkerUrl(entrypoint))],
     { ...process.env, NODE_OPTIONS: "", TSX_DISABLE_CACHE: "1" },
     15_000,
     {
