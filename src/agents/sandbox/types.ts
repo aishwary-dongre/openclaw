@@ -115,8 +115,6 @@ export type SandboxContext = {
   runtimeId: string;
   runtimeLabel: string;
   containerName: string;
-  /** Set when this resolution created the runtime instead of reusing a registered one. */
-  createdRuntime?: true;
   containerWorkdir: string;
   docker: SandboxDockerConfig;
   tools: SandboxToolPolicy;
