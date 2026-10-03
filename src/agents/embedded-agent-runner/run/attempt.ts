@@ -3,6 +3,7 @@ import {
   OPENCLAW_EMBEDDED_CONTEXT_ENGINE_HOST,
 } from "../../../context-engine/host-compat.js";
 import { resolveContextEngineOwnerPluginId } from "../../../context-engine/registry.js";
+import { formatErrorMessage } from "../../../infra/errors.js";
 import { runWithAsyncWorkResources } from "../../../shared/async-work-resources.js";
 import { getAsyncWorkSignal } from "../../../shared/async-work-scope.js";
 import { createStageTimingTracker } from "../../../shared/stage-timing.js";
@@ -22,6 +23,10 @@ import {
 import { resolveAgentDir } from "../../agent-scope.js";
 import { buildExecAutoReviewTranscript } from "../../exec-auto-review-transcript.js";
 import { recordAgentCleanupFailure, runOwnedAgentCleanup } from "../../run-cleanup-timeout.js";
+import {
+  createSandboxSetupRollback,
+  type SandboxSetupRollback,
+} from "../../sandbox/setup-rollback.js";
 import { withRuntimeToolSchemaQuarantine } from "../../tool-schema-quarantine.js";
 import {
   clearToolSearchCatalog,
@@ -69,6 +74,8 @@ export async function runEmbeddedAttempt(
     provider: input.provider,
     model: input.modelId,
   });
+  // Sandbox generations this attempt's setup allocates stay attempt-owned until dispatch.
+  const sandboxSetup = createSandboxSetupRollback();
   try {
     const attempt = modelExecution
       ? {
@@ -87,6 +94,7 @@ export async function runEmbeddedAttempt(
     const result = await runWithAsyncWorkResources((onAcquired) =>
       runEmbeddedAttemptOwned(
         attempt,
+        sandboxSetup,
         (release) => onAcquired({ release, releaseBeforeResultWhenIdle: true }),
         resourceAbortSignal,
       ),
@@ -94,12 +102,36 @@ export async function runEmbeddedAttempt(
     modelExecution?.assertCurrent();
     return result;
   } finally {
+    // A no-op once dispatch took the sandbox. After an earlier failure it may run beside
+    // retained tool release, which is safe only because no tool runs before hand-off.
+    // A rollback failure never replaces the attempt's own outcome.
+    await rollbackSandboxSetup(input, sandboxSetup);
     modelExecution?.release();
+  }
+}
+
+async function rollbackSandboxSetup(
+  attempt: EmbeddedRunAttemptParams,
+  sandboxSetup: SandboxSetupRollback,
+): Promise<void> {
+  try {
+    await runOwnedAgentCleanup({
+      ...attempt,
+      step: "sandbox-setup-rollback",
+      cleanup: () => sandboxSetup.rollback(),
+      log,
+    });
+  } catch (cleanupErr) {
+    recordAgentCleanupFailure();
+    log.warn(
+      `failed to roll back sandbox setup after early attempt exit: runId=${attempt.runId} ${formatErrorMessage(cleanupErr)}`,
+    );
   }
 }
 
 async function runEmbeddedAttemptOwned(
   input: EmbeddedRunAttemptParams,
+  sandboxSetup: SandboxSetupRollback,
   retainToolCleanup: (release: () => Promise<void>) => void,
   resourceAbortSignal: AbortSignal | undefined,
 ): Promise<EmbeddedRunAttemptResult> {
@@ -107,7 +139,7 @@ async function runEmbeddedAttemptOwned(
   const runAbortController = new AbortController();
   const setup = await measureEmbeddedAgentPreparation(
     "attempt.setup",
-    () => prepareEmbeddedAttemptSetup(params),
+    () => sandboxSetup.run(() => prepareEmbeddedAttemptSetup(params)),
     {
       config: params.config,
     },
@@ -425,6 +457,8 @@ async function runEmbeddedAttemptOwned(
           ...(params.swarmCollector && params.swarmOutputSchema ? ["structured_output"] : []),
         ],
       });
+      // Dispatch may use the sandbox from here on, so later failures keep its generation.
+      sandboxSetup.handOff();
       const executionResult = await runEmbeddedAttemptExecutionPhase({
         attempt: params,
         ...(activeContextEngine ? { activeContextEngine } : {}),
