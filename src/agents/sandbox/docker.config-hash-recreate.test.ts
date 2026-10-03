@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { createAdmittedRunOperatorAuthority } from "../admitted-run-context.js";
 import { SANDBOX_DOCKER_EXPLICIT_ENV_POLICY_EPOCH } from "./config-hash.js";
 import { SANDBOX_DOCKER_CREATE_ARGS_EPOCH } from "./constants.js";
 import { createSandboxContainerTestHarness } from "./docker.create.test-helpers.js";
@@ -496,16 +497,25 @@ describe("ensureSandboxContainer config-hash recreation", () => {
   });
 
   it.each([
-    { activeTarget: "unchanged", removes: true },
-    { activeTarget: "switched to a machine", removes: false },
+    { activeTarget: "unchanged", access: "live", removes: true },
+    { activeTarget: "switched to a machine", access: "live", removes: false },
+    { activeTarget: "unchanged", access: "revoked during the target probe", removes: false },
   ])(
-    "retires a Podman setup allocation only on its own engine target ($activeTarget)",
-    async ({ removes }) => {
+    "retires a Podman setup allocation only on its own engine target ($activeTarget, access $access)",
+    async ({ activeTarget, access, removes }) => {
       const cfg = createSandboxConfig([]);
       cfg.scope = "session";
       spawnState.containerExists = false;
       spawnState.inspectRunning = false;
       registryMocks.readRegistryEntry.mockResolvedValue(null);
+      const grant = new AbortController();
+      const operatorAuthority = createAdmittedRunOperatorAuthority({
+        profileId: "operator",
+        scopes: ["operator.write"],
+        gatewayAccessGrant: null,
+        signal: grant.signal,
+        assertCurrent: () => grant.signal.throwIfAborted(),
+      });
       const setup = createSandboxSetupRollback();
       const { containerName, containerId } = await setup.run(() =>
         harness.ensureSandboxContainer({
@@ -514,16 +524,22 @@ describe("ensureSandboxContainer config-hash recreation", () => {
           workspaceDir: "/tmp/workspace",
           agentWorkspaceDir: "/tmp/workspace",
           cfg,
+          operatorAuthority,
         }),
       );
-      if (!removes) {
+      if (activeTarget !== "unchanged") {
         // The local target pins no connection, so removal would reach the new one.
         usePodmanMachine();
       }
+      if (access !== "live") {
+        // Revocation keeps the writable layer even when it lands mid-validation.
+        spawnState.holdPodmanProbe = async () => grant.abort(new Error("access revoked"));
+      }
       const rollback = setup.rollback();
-      await (removes
+      await (activeTarget === "unchanged"
         ? expect(rollback).resolves.toBeUndefined()
         : expect(rollback).rejects.toThrow(/active Podman connection changed/u));
+      expect(grant.signal.aborted).toBe(access !== "live");
       expect(spawnState.calls.filter((call) => call.args[0] === "rm")).toEqual(
         removes ? [{ command: "podman", globalArgs: [], args: ["rm", "-f", containerId] }] : [],
       );

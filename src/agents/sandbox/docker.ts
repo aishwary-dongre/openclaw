@@ -659,11 +659,16 @@ async function ensureSandboxContainerLifecycle(
           name: containerName,
           retire: async () => {
             // As for a failed allocation, revocation keeps the writable layer.
-            if (operatorAuthority?.signal?.aborted) {
+            const revoked = () => operatorAuthority?.signal?.aborted === true;
+            if (revoked()) {
               return;
             }
             // A new sequence: the active Podman connection may have changed since allocation.
             await validateSandboxContainerEngineTarget(engine, podmanRuntimeInfo?.target);
+            // Revocation can land while the probe is pending; recheck right before removal.
+            if (revoked()) {
+              return;
+            }
             const cleanupErrors = await removeAllocatedSandboxGeneration({
               engine,
               containerName,
