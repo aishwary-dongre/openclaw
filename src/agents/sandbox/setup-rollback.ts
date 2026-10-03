@@ -11,7 +11,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { resolveGlobalSingleton } from "../../shared/global-singleton.js";
 
 /** One recorded allocation; both callbacks belong to the runtime's lifecycle owner. */
-export type SandboxSetupAllocation = {
+type SandboxSetupAllocation = {
   /** Remove the exact generation unless a later lifecycle operation claimed it. */
   retire: () => Promise<void>;
   /** Forget the record without touching the runtime. */
